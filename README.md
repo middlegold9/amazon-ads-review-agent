@@ -1,186 +1,180 @@
 # amazon-ads-review-agent
 
-> Amazon 广告复盘 Agent —— 自动拉取广告报表、诊断异常、给调价与否定词建议，可验证可复盘。
+> **Amazon 广告复盘 Agent** —— 自动拉取广告报表、诊断异常、给调价与否定词建议，可验证可复盘。
 > 运营的 hero 场景，outcome 最硬（ACOS↓、人效↑），最易量化验证、最易讲成面试故事。
 
-> 阶段：**功能设计（Design）**。本仓库当前为端到端功能梳理文档，代码骨架待落地。
+> 状态：**已落地 + 17/17 单测通过**（Python，含完整 orchestrator 链路）。默认**仅建议**，人类审批后才可选执行。
 
 ---
 
-## 0. 背景与动机
+## 1. 这个工具解决什么问题
 
-PPC 运营每天：从广告后台拉报表 → 找异常（烧钱无转化、曝光跌、ACOS 超标）→ 调价 / 加否定词 / 调预算。一个运营管数十个活动，手工 1–2h/天，且依赖经验。Agent 把这套「诊断 → 建议 → 执行 → 复盘」自动化，人类只做审批。
+PPC 运营每天：从广告后台拉报表 → 找异常（烧钱无转化、曝光跌、ACOS 超标）→ 调价 / 加否定词 / 调预算。一个运营管数十个活动，手工 1–2h/天，且高度依赖经验，易漏、易错、难复盘。
 
-**FDE 视角**：这是「可验证、可复盘」的最佳示范——效果可用历史数据回测，策略可沉淀为规则库（高速公路）。对应 FDE 文档 9.4：把现场解法回流成平台能力，越做越轻。
+本 Agent 把「**采集 → 计算 → 诊断 → 建议 → 审批 → 执行 → 复盘 → 回测**」自动化：
 
----
-
-## 1. 目标与范围
-
-**Goals**
-- 定时拉取多账户 / 多市场广告数据（经 **sp-api-mcp-server** 的 `ads_*` 工具）。
-- 自动诊断异常（规则 + LLM 叙事）。
-- 生成可执行的优化建议（调价、否定词、预算、暂停）。
-- 人类审批后可选自动执行（写接口带护栏）。
-- 每日 / 周自然语言复盘报告 + 预警推送（飞书 / 企微）。
-- 回测验证 + 策略库沉淀。
-
-**Personas**：PPC 专员、代运营、品牌主。
-
-**Non-goals**
-- 不替代最终决策；v1 自动执行默认关闭（仅建议）。
-- 不覆盖 DSP（仅 SP / SB / SD）。
+- **省人效**：每天自动出诊断与建议，运营只做审批，处理时长可降 60%+。
+- **可验证**：用历史快照回测，诊断建议与资深运营操作的吻合率可量化（目标 ≥ 85%）。
+- **可复盘**：策略沉淀为版本化规则库，按品类（3C / 服饰）配置阈值，越用越准。
+- **不烧钱**：写执行（调价 / 否定词）默认关闭，受审批网关 + 出价护栏（下调不低于原值 50%）双重保护。
 
 ---
 
-## 2. 端到端链路
+## 2. 核心能力
+
+| 能力 | 说明 |
+|---|---|
+| **指标计算** | ACOS、ROAS、TACOS、CTR、CVR、CPA、曝光份额（IS）等。 |
+| **数据采集** | 经 `sp-api-mcp-server` 的 `ads_*` 工具拉表现 / 搜索词报表（异步 → 轮询 → gzip 下载），CSV 解析，本地快照便于回测。 |
+| **诊断引擎** | 规则层：`acos_above_target`、`spend_no_order`、`low_ctr`、`low_cvr`；可选 LLM 层生成自然语言归因 + 影响估算。 |
+| **建议生成** | 调价 / 暂停 / 优化创意 / 否定词挖掘。否定词从搜索词报表筛「有花费且 0 单且无关」候选（**自动排除品牌词**，防误伤）。 |
+| **审批网关** | 默认 `writes_allowed=false` → 仅建议不执行；开启 `ADS_APPROVE_WRITES` 后才落库，且出价下调不低于原值 50%。 |
+| **复盘报告** | 自然语言摘要 + Top 异常 / Top 机会 + 可选图表，推送到飞书 / 企微 Webhook。 |
+| **回测验证** | 读历史快照重放建议，对比「若执行当时建议」vs 实际，出吻合率。 |
+| **策略库** | 规则版本化 + `category_thresholds.yaml` 按品类配置阈值。 |
+
+---
+
+## 3. 端到端链路
 
 ```
-[调度触发 cron 每日 09:00 / 周]
-   │ 1. 调 sp-api-mcp: ads_profiles_list → 各市场 profileId
-   ▼
-[数据采集]
-   │ 2. ads_performance_report(按天/周) + ads_searchterms_report +
-   │    ads_campaigns/adgroups/keywords/targets 快照
-   ▼
-[归一化 & 指标计算]
-   │ 3. 算 ACOS=广告花费/销售额, ROAS, TACOS, CTR, CVR, CPA,
-   │    Impression Share, IS lost to budget/rank, 新词有花费无转化
-   ▼
-[诊断引擎]
-   │ 4a. 规则层：ACOS>目标、花费>0 无单、CTR<基准、预算早耗尽、
-   │     排名跌、新竞品涌入、预算不足限流
-   │ 4b. LLM 层：对异常生成自然语言归因 + 影响估算
-   ▼
-[建议生成]
-   │ 5. 调价(±%)、否定词挖掘(搜索词报表筛无转化词)、
-   │    预算再分配、暂停低效、分时段(dayparting)
-   ▼
-[人类审批网关]
-   │ 6. 生成审批卡片(飞书/企微) → 运营确认/修改/驳回
-   ▼
-[执行(若批准)]
-   │ 7. 调 sp-api-mcp 写接口 ads_campaign_update / ads_negativekeyword_create
-   │    （护栏：单次预算变更上限、需二次确认）
-   ▼
-[复盘报告]
-   │ 8. NL 报告 + 图表(top movers / ACOS 趋势) + 推送
-   ▼
-[反馈闭环]
-   │ 9. 记录「建议→是否执行→执行后续效果」
-   ▼
-[策略库沉淀]
-      10. 高频有效规则写入规则库 → 复用(高速公路)
+[cron 每日 09:00 / 周]
+  └─ ads_profiles_list → 各市场 profileId
+       └─ 采集：ads_performance_report + ads_searchterms_report + 快照
+            └─ 指标计算：ACOS / ROAS / TACOS / CTR / CVR ...
+                 └─ 诊断引擎（规则 + 可选 LLM 叙事）
+                      └─ 建议生成（调价 / 否定词 / 预算 / 暂停）
+                           └─ 审批网关（飞书卡片 → 运营确认 / 修改 / 驳回）
+                                └─ 执行（若批准，带出价护栏，经 sp-api-mcp 写接口）
+                                     └─ 复盘报告（NL + 图表 + 推送）
+                                          └─ 反馈闭环：建议→是否执行→后续效果
+                                               └─ 策略库沉淀（高速公路）
 ```
 
 ---
 
-## 3. 功能模块
+## 4. 快速开始
 
-### 3.1 数据采集
-- 多 profile 遍历；报表异步创建 → 轮询 → 下载 gzip。
-- 增量：仅拉上次以来数据；快照存本地便于回测。
+```bash
+cd amazon-ads-review-agent
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e .
+# 或装：pydantic pydantic-settings httpx pyyaml
+cp .env.example .env   # 填 MCP_BASE_URL / ADS_APPROVE_WRITES / FEISHU_WEBHOOK / TARGET_ACOS
+```
 
-### 3.2 指标计算
-- 核心：ACOS、ROAS、TACOS（总广告销售 / 总销售）、CTR、CVR、CPA。
-- 诊断辅助：Impression Share、IS lost to budget/rank、新搜索词、新 ASIN 抢量。
+### 跑一次复盘（编排入口 `orchestrator.run`）
 
-### 3.3 诊断引擎（规则 + LLM）
-规则示例：
-- ACOS 高于目标阈值且花费 > 中位 → 降出价。
-- 搜索词有花费 N 天无转化 → 加否定（exact / phrase）。
-- CTR 低于类目基准 → 检查素材 / 关键词相关性。
-- 预算在时段早耗尽 → 提预算或 dayparting。
-- 排名 / IS 跌 → 加价抢位。
-- 新竞品 ASIN 出现在投放目标 → 提示。
-- LLM：把触发规则聚合成一段「本周发生了什么、为什么、影响多少」。
+```python
+from ads_agent.orchestrator import run
+from ads_agent.collect import MCPClient
 
-### 3.4 建议生成
-- 结构化输出：`{entity, action, old, new, rationale, expected_impact, confidence}`。
-- 否定词挖掘：从 searchterms 报表筛「花费 ≥ X 且 0 单且无关」→ 候选否定词列表（人工确认）。
+# 真实接入：把 base_url 指向 sp-api-mcp-server 的 SSE/HTTP 端点
+client = MCPClient(base_url="http://localhost:8000", token="")
 
-### 3.5 审批与执行
-- 默认仅建议；开启自动执行需审批 + 护栏（预算变更 ≤ 设定上限/次，出价 ± ≤ 20%）。
-- 所有写操作留审计日志。
+report = run(
+    date="2026-07-04",
+    client=client,
+    brand_keywords=["yourbrand"],   # 用于否定词挖掘时排除品牌词
+    # push_fn=my_feishu_pusher,     # 可选：注入推送函数
+)
+print(report["summary"])            # 自然语言复盘摘要
+print(report["auto_executed"])      # False（默认仅建议）
+```
 
-### 3.6 复盘报告
-- NL 摘要 + Top 5 异常 + Top 5 机会 + 图表。
-- 推送飞书 / 企微 Webhook。
-
-### 3.7 回测 / 验证
-- 读历史快照，模拟「若执行当时建议」的 ACOS / ROAS 走向，对比实际。
-- 用于校验诊断准确率（与资深运营标注比对）。
-
-### 3.8 策略库
-- 规则版本化；有效规则沉淀为默认；可针对品类定制（3C vs 服饰阈值不同）。
-
-### 3.9 预警
-- 实时 / 准实时：ACOS 突增、预算耗尽、某 SKU 销量暴跌 → 即时推送。
+> 单测里用 stub `MCPClient`（直接返回样例 CSV）即可离线跑通整条链路，无需真实亚马逊凭证。
 
 ---
 
-## 4. 架构
-- 编排：LangGraph / 简单 DAG（采集 → 计算 → 诊断 → 建议 → 审批 → 执行 → 报告）。
-- 数据：**sp-api-mcp-server**（ads_*）；存储 Postgres / DuckDB（快照、建议、效果）。
-- LLM：诊断叙事 + nuanced 建议；规则引擎做确定性判断。
-- 调度：cron / 云函数。
-- 通知：飞书 / 企微 Webhook。
-- 前端（可选）：复盘看板（Streamlit / Gradio）。
+## 5. 关键函数 / 模块用法
+
+| 模块 | 用途 | 关键函数 |
+|---|---|---|
+| `metrics` | 指标计算 | `compute_metrics(snapshot) -> Metric` |
+| `collect` | 经 MCP 拉报表 + CSV 解析 | `MCPClient(base_url, token).call(name, args)`；`collect(date, profiles, client)` |
+| `diagnose` | 规则 + 可选 LLM 叙事 | `diagnose(snapshot, metric, thresholds, llm_fn)` |
+| `strategies` | 版本化规则 + 品类阈值 | `get_thresholds(category)` |
+| `suggest` | 建议 + 否定词挖掘 | `suggest(snapshots, diagnoses, thresholds, searchterms, brand_keywords)` |
+| `approve` | 审批网关 + 飞书推送 | `writes_allowed(settings)`；`notify(report, settings, push_fn)` |
+| `execute` | 经 MCP 写接口（带护栏） | `execute_suggestion(sugg, client, settings)` |
+| `report` | NL 摘要 + 图表 | `build_report(date, snapshots, metrics_map, diagnoses, suggestions)` |
+| `backtest` | 历史重放吻合率 | `backtest(snapshots, suggestions, actual)` |
+| `orchestrator` | 串起以上 DAG | `run(date, client, settings, profiles, llm_fn, push_fn, brand_keywords)` |
+
+### 5.1 建议结构（结构化）
+```json
+{
+  "entity": "campaignId",
+  "action": "reduce_bid | add_negative_kw | pause_or_review | optimize_creative",
+  "old": 1.20, "new": 0.95,
+  "rationale": "ACOS 高于目标且花费超中位",
+  "expected_impact": "ACOS 预计下降 N%",
+  "confidence": 0.8
+}
+```
+
+### 5.2 否定词挖掘（自动排除品牌词）
+```python
+from ads_agent.suggest import suggest
+suggestions = suggest(snaps, diags, thr, searchterms=sts, brand_keywords=["yourbrand"])
+# 仅返回「有花费、0 单、且与品牌无关」的候选否定词，避免误伤自身品牌流量
+```
+
+### 5.3 回测
+```python
+from ads_agent.backtest import backtest
+score = backtest(snapshots, suggestions, actual_effects)
+# → 吻合率（建议与实际执行的重叠度），用于校验诊断准确率
+```
 
 ---
 
-## 5. 配置
-- `.env.example`：`MCP_BASE_URL`, `LLM_*`, `TARGET_ACOS`, `BUDGET_CHANGE_CAP`, `AUTO_EXECUTE=false`, `FEISHU_WEBHOOK`。
-- 品类阈值配置：`category_thresholds.yaml`。
+## 6. 配置项（环境变量）
+
+| 变量 | 说明 |
+|---|---|
+| `MCP_BASE_URL` / `MCP_TOKEN` | 指向 `sp-api-mcp-server` 端点（数据源 + 写执行） |
+| `TARGET_ACOS` | 目标 ACOS 阈值（诊断触发线） |
+| `ADS_APPROVE_WRITES` | `false`（默认，仅建议）/ `true`（允许自动执行） |
+| `BUDGET_CHANGE_CAP` | 单次预算变更上限（护栏） |
+| `FEISHU_WEBHOOK` | 飞书自定义机器人 Webhook，复盘报告推送 |
+| `CATEGORY` | 品类（读 `category_thresholds.yaml` 的 3C / 服饰阈值） |
+
+品类阈值见 `category_thresholds.yaml`：`target_acos`、`min_ctr`、`min_cvr` 等按品类区分。
 
 ---
 
-## 6. 安全与合规
-- **预算护栏**：自动执行有上限，重大变更强制人工。
+## 7. 安全与合规
+
+- **预算护栏**：自动执行有上限，重大变更强制人工；出价下调不低于原值 50%。
 - **亚马逊广告政策**：不刷量、不违规定位；否定词不误伤品牌词。
-- **数据隐私**：报表本地存，外传需显式开启。
-- **审计**：每次建议 / 执行留痕。
+- **审批网关**：默认 `blocked`，杜绝误烧钱 / 误调价。
+- **数据隐私**：报表本地快照，外传需显式开启。
+- **审计**：每次建议 / 执行留痕，回测可追溯。
 
 ---
 
-## 7. 可验证
-- **回测准确**：历史快照上，诊断建议与资深运营实际操作的吻合率（目标 ≥ 85% 一致或更好）。
-- **异常召回**：构造含已知异常的数据集，断言被识别。
-- **ACOS 影响**：上线后 A/B（采纳组 vs 对照组）看 ACOS / ROAS 改善。
-- **人效**：运营日均处理时长下降 %（目标 ≥ 60%）。
+## 8. 测试
+
+```bash
+source .venv/bin/activate
+PYTHONPATH=src python -m pytest -q
+# 17 passed —— 覆盖：指标计算、诊断规则、建议+否定词挖掘、审批网关、
+#             回测吻合率、以及完整 orchestrator.run 链路（含 stub 客户端）
+```
 
 ---
 
-## 8. 可复盘
-- 每周策略复盘会：哪些建议被采纳 / 驳回 → 修规则 / 阈值。
-- 指标追踪：ACOS 趋势、采纳率、误报率。
-- 策略库版本化，回归测试防退化。
+## 9. 与另两个项目的关系
+
+- **强依赖 sp-api-mcp-server**：所有广告数据来自 `ads_*` 工具；写执行（`ads_campaign_update` / `ads_negative_keyword_create`）经其审批网关。
+- 与 **seller-central-reply-assistant** 共享「审批网关 / 护栏 / 人类在环」原则。
 
 ---
 
-## 9. 与另两个项目关系
-- 强依赖 **sp-api-mcp-server** 的 `ads_*` 工具（数据源 + 写执行）。
-- 与 **seller-central-reply-assistant** 共享「审批网关 / 护栏」理念。
+## 10. 参考资料
 
----
-
-## 10. 路线图
-- **M1**：采集 + 指标 + 规则诊断 + NL 报告（仅建议）。
-- **M2**：否定词挖掘 + 审批网关 + 飞书推送。
-- **M3**：回测框架 + 策略库 + 品类阈值。
-- **M4**：可选自动执行 + 看板 + 多账户。
-
----
-
-## 11. 风险与开放问题
-- 广告报表异步 + gzip，需健壮轮询与去重。
-- 自动执行风险：错调价烧钱 → 护栏 + 默认关闭。
-- 归因复杂：ACOS 波动受季节 / 库存影响，诊断需标注「不确定性」。
-
----
-
-## 12. 参考资料
 - 广告 API：https://advertising.amazon.com/API/docs/en-us/reference
 - SP-API：https://developer-docs.amazon/sp-api/docs
-- 配套 MCP：middlegold9/sp-api-mcp-server
-- 配套客服插件：middlegold9/seller-central-reply-assistant
+- 配套 MCP：https://github.com/middlegold9/sp-api-mcp-server
+- 配套客服插件：https://github.com/middlegold9/seller-central-reply-assistant
